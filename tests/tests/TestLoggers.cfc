@@ -2,16 +2,16 @@
 	<cfscript>
 
 		function test_hoth(){
-			var mockHoth = mock();
+			var mockHoth = getMockBox().createMock(className="Hoth.HothTracker", callLogging=true);
 			var hothAdapter = '';
 			var fakeError = {};
-
+			var callLog = {};
 			//setup the behaviors we're expecting the adapter to run
-			mockHoth.track('{struct}');
-
+			//mockHoth.track('{struct}');
+			mockHoth.$('track', true);
 			//create hoth adapter to test
 			hothAdapter = createObject("component", "taffy.bonus.LogToHoth").init(
-				"taffy.examples.api_hoth.resources.HothConfig",
+				"Taffy.examples.api_Hoth.resources.HothConfig",
 				mockHoth
 			);
 
@@ -20,20 +20,35 @@
 			fakeError.detail = "Rubber Baby Buggy Bumper";
 			hothAdapter.saveLog(fakeError);
 
-			mockHoth.verify().track('{struct}');
+			callLog = mockHoth.$callLog();
+			debug(callLog);
+			assertTrue(structKeyExists(callLog, "track"), "should call track method");
+			assertTrue(isStruct(callLog.track[1][1]), "args should be a struct");
+			assertEquals(callLog.track[1][1].message, fakeError.message);
+
 		}
 
 		function test_BugLogHQ(){
-			var mockBLHQ = mock();
+			var blhqSettings = { bugLogListener = "http://#cgi.server_name#:#cgi.server_port#/tests/BugLogHQ/listeners/bugLogListenerREST.cfm" };
+			var mockBLHQ = new bugLog.client.bugLogService(argumentCollection=blhqSettings);
 			var blhqAdapter = '';
-			var blhqSettings = { bugLogListener = "http://localhost/bugLog/listeners/bugLogListenerREST.cfm" };
 			var fakeError = {};
+			fakeError.message = "This is a test error";
+			fakeError.detail = "Rubber Baby Buggy Bumper";
 
-			mockBLHQ.notifyService('{string}', '{struct}');
+			if (structKeyExists(server, "coldfusion") && structKeyExists(server.coldfusion, "productversion")) {
+				if (val(listFirst(server.coldfusion.productversion)) < 11) {
+					//datasource definition will only work on CF11+
+					return;
+				}
+			}
+
+
+			mockBLHQ.init(argumentCollection=blhqSettings);
 
 			blhqAdapter = createObject("component", "taffy.bonus.LogToBugLogHQ").init(
-				blhqSettings,
-				mockBLHQ
+				config=blhqSettings,
+				tracker=mockBLHQ
 			);
 
 			//fake error
@@ -41,7 +56,7 @@
 			fakeError.detail = "Rubber Baby Buggy Bumper";
 			blhqAdapter.saveLog(fakeError);
 
-			mockBLHQ.verify().notifyService('{string}', '{struct}');
+
 		}
 
 	</cfscript>

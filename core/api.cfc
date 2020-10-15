@@ -19,6 +19,25 @@
 		<cfreturn true />
 	</cffunction>
 
+	<!---
+		onTaffyRequestEnd gives you the opportunity to access the request after it has been processed by the service.
+		If you override this function, you MUST either return TRUE or a representation object
+		(eg either taffy.core.nativeJsonSerializer or your default representation class)
+	--->
+	<cffunction name="onTaffyRequestEnd" output="false">
+		<cfargument name="verb" />
+		<cfargument name="cfc" />
+		<cfargument name="requestArguments" />
+		<cfargument name="mimeExt" />
+		<cfargument name="headers" />
+		<cfargument name="methodMetadata" />
+		<cfargument name="matchedURI" />
+		<cfargument name="parsedResponse" />
+		<cfargument name="originalResponse" />
+		<cfargument name="statusCode" />
+		<cfreturn true />
+	</cffunction>
+
 	<!--- override these functions to implement caching hooks --->
 	<cffunction name="validCacheExists" output="false">
 		<cfargument name="cacheKey" />
@@ -30,6 +49,13 @@
 	</cffunction>
 	<cffunction name="getCachedResponse" output="false">
 		<cfargument name="cacheKey" />
+	</cffunction>
+	<cffunction name="getCacheKey" output="false">
+		<cfargument name="cfc" />
+		<cfargument name="requestArguments" />
+		<cfargument name="matchedURI" />
+
+		<cfreturn arguments.matchedURI & "_" & arguments.requestArguments.hashCode() />
 	</cffunction>
 
 	<!--- Your Application.cfc should override this method AND call super.onApplicationStart() --->
@@ -65,7 +91,7 @@
 			(
 				application._taffy.settings.reloadOnEveryRequest eq true
 			)>
-			<cfif !local.reloadedInThisRequest><!--- prevent double reloads --->
+			<cfif !local.reloadedInThisRequest and !isUnhandledPathRequest(arguments.targetPath)><!--- prevent double reloads --->
 				<cfset onApplicationStart() />
 			</cfif>
 		</cfif>
@@ -79,7 +105,7 @@
 				AND listFindNoCase(cgi.script_name, "index.cfm", "/") EQ listLen(cgi.script_name, "/")>
 				<cfif NOT application._taffy.settings.disableDashboard>
 					<cfif StructKeyExists( URL, "docs" )>
-						<cfinclude template="../dashboard/docs.cfm" />
+						<cfinclude template="#application._taffy.settings.docsPath#" />
 					<cfelse>
 						<cfinclude template="../dashboard/dashboard.cfm" />
 					</cfif>
@@ -168,6 +194,8 @@
 		<cfset var _taffyRequest = {} />
 		<cfset var local = {} />
 		<cfset var m = '' />
+		<cfset request._taffyRequest = _taffyRequest />
+		<cfset local.debug = false />
 
 		<cfset _taffyRequest.metrics = {} />
 		<cfset m = _taffyRequest.metrics />
@@ -186,7 +214,7 @@
 			AND listFindNoCase(cgi.script_name, "index.cfm", "/") EQ listLen(cgi.script_name, "/")>
 			<cfif NOT application._taffy.settings.disableDashboard>
 				<cfif StructKeyExists( URL, "docs" )>
-					<cfinclude template="../dashboard/docs.cfm" />
+					<cfinclude template="#application._taffy.settings.docsPath#" />
 				<cfelse>
 					<cfinclude template="../dashboard/dashboard.cfm" />
 				</cfif>
@@ -196,7 +224,7 @@
 					<cflocation url="#application._taffy.settings.disabledDashboardRedirect#" addtoken="false" />
 					<cfabort />
 				<cfelseif application._taffy.settings.showDocsWhenDashboardDisabled>
-					<cfinclude template="../dashboard/docs.cfm" />
+					<cfinclude template="#application._taffy.settings.docsPath#" />
 					<cfabort />
 				<cfelse>
 					<cfset throwError(403, "Forbidden") />
@@ -297,7 +325,11 @@
 			<cfif structKeyExists(_taffyRequest.matchDetails.methods, _taffyRequest.verb)>
 				<!--- check the cache before we call the resource --->
 				<cfset m.cacheCheckTime = getTickCount() />
-				<cfset local.cacheKey = local.parsed.uri & "_" & _taffyRequest.requestArguments.hashCode() />
+				<cfset local.cacheKey = getCacheKey(
+					_taffyRequest.matchDetails.beanName
+					,_taffyRequest.requestArguments
+					,local.parsed.matchDetails.srcUri
+				) />
 				<cfif ucase(_taffyRequest.verb) eq "GET" and validCacheExists(local.cacheKey)>
 					<cfset m.cacheCheckTime = getTickCount() - m.cacheCheckTime />
 					<cfset m.cacheGetTime = getTickCount() />
@@ -319,9 +351,21 @@
 					/>
 					<cfset m.afterResource = getTickCount() />
 					<cfset m.resourceTime = m.afterResource - m.beforeResource />
-					<cfif ucase(_taffyRequest.verb) eq "GET">
+					<cfif !isDefined("_taffyRequest.result")>
+						<cfthrow
+							message="Resource did not return a value"
+							detail="The resource is expected to return a call to rep()/representationOf() or noData(). It appears there was no return at all."
+							errorcode="taffy.resources.ResourceReturnsNothing"
+						/>
+					</cfif>
+					<!--- If the type returned is not an instance of baseSerializer, wrap it with a call to rep().
+					This way we can directly return the object instead of a serializer from resource actions. --->
+					<cfif !isInstanceOf(_taffyRequest.result, "taffy.core.baseSerializer")>
+						<cfset _taffyRequest.result = rep(_taffyRequest.result) />
+					</cfif>
+					<cfif ucase(_taffyRequest.verb) eq "GET" and structKeyExists(local, "cacheKey")>
 						<cfset m.cacheSaveStart = getTickCount() />
-						<cfset setCachedResponse(local.cacheKey, _taffyRequest.result.getData()) />
+						<cfset setCachedResponse(local.cacheKey, _taffyRequest.result) />
 						<cfset m.cacheSaveTime = getTickCount() - m.cacheSaveStart />
 					</cfif>
 				</cfif>
@@ -376,15 +420,33 @@
 			<cfheader name="X-TIME-IN-CACHE-CHECK" value="#m.cacheCheckTime#" />
 		</cfif>
 		<cfif structKeyExists(m, "cacheGetTime")>
-			<cfheader name="X-TIME-IN-CACHE-GET" value="#m.cacheSaveTime#" />
+			<cfheader name="X-TIME-IN-CACHE-GET" value="#m.cacheGetTime#" />
 		</cfif>
 		<cfif structKeyExists(m, "cacheSaveTime")>
 			<cfheader name="X-TIME-IN-CACHE-SAVE" value="#m.cacheSaveTime#" />
 		</cfif>
 
+		<cfif application._taffy.settings.exposeHeaders>
+			<cfset local.exposeHeaderList = structKeyList(_taffyRequest.resultHeaders) />
+			<cfset local.exposeHeaderValue = "" />
+			<cfif application._taffy.settings.useEtags and _taffyRequest.verb eq "GET" and _taffyRequest.result.getType() eq "textual">
+				<cfset local.exposeHeaderList = listAppend(local.exposeHeaderList, "Etag") />
+			</cfif>
+			<cfloop list="#local.exposeHeaderList#" index="local.exposeHeader">
+				<!--- filter out default simple response headers: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Expose-Headers --->
+				<cfif not listFindNoCase("Cache-Control,Content-Language,Content-Type,Expires,Last-Modified,Pragma", local.exposeHeader)>
+					<cfset local.exposeHeaderValue = listAppend(local.exposeHeaderValue, local.exposeHeader) />
+				</cfif>
+			</cfloop>
+			<cfif listLen(local.exposeHeaderValue) gt 0>
+				<cfheader name="Access-Control-Expose-Headers" value="#local.exposeHeaderValue#" />
+			</cfif>
+		</cfif>
+
 		<!--- result data --->
 		<cfif structKeyExists(_taffyRequest,'result')>
 			<cfset _taffyRequest.resultType = _taffyRequest.result.getType() />
+			<cfset local.resultSerialized = '' />
 
 			<cfif _taffyRequest.resultType eq "textual">
 				<!--- serialize the representation's data into the requested mime type --->
@@ -405,9 +467,16 @@
 
 				<!--- don't return data if etags are enabled and the data hasn't changed --->
 				<cfif application._taffy.settings.useEtags and _taffyRequest.verb eq "GET">
+					<!--- etag values are quoted per: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/ETag --->
+					<cfif structKeyExists(server, "lucee")>
+						<!--- hashCode() will not work for lucee, see issue #354 --->
+						<cfset _taffyRequest.serverEtag = '"' & hash(_taffyRequest.resultSerialized) & '"' />
+					<cfelse>
+						<cfset _taffyRequest.serverEtag = '"' & _taffyRequest.result.getData().hashCode() & '"' />
+					</cfif>
 					<cfif structKeyExists(_taffyRequest.headers, "If-None-Match")>
 						<cfset _taffyRequest.clientEtag = _taffyRequest.headers['If-None-Match'] />
-						<cfset _taffyRequest.serverEtag = _taffyRequest.result.getData().hashCode() />
+
 						<cfif len(_taffyRequest.clientEtag) gt 0 and _taffyRequest.clientEtag eq _taffyRequest.serverEtag>
 							<cfheader statuscode="304" statustext="Not Modified" />
 							<cfcontent reset="true" type="#application._taffy.settings.mimeExtensions[_taffyRequest.returnMimeExt]#; charset=utf-8" />
@@ -416,21 +485,24 @@
 							<cfheader name="Etag" value="#_taffyRequest.serverEtag#" />
 						</cfif>
 					<cfelse>
-						<cfheader name="Etag" value="#_taffyRequest.result.getData().hashCode()#" />
+						<cfheader name="Etag" value="#_taffyRequest.serverEtag#" />
 					</cfif>
 				</cfif>
 
 				<cfset m.done = getTickCount() />
-				<cfset m.taffyTime = m.done - m.init - m.parseTime - m.otrTime - m.resourceTime - m.serializeTime />
+				<cfset m.taffyTime = m.done - m.init - m.parseTime - m.otrTime - m.serializeTime />
+				<cfif structKeyExists(m, "resourceTime")>
+					<cfset m.taffyTime -= m.resourceTime />
+				</cfif>
 				<cfheader name="X-TIME-IN-TAFFY" value="#m.taffyTime#" />
 
 				<cfcontent reset="true" type="#application._taffy.settings.mimeExtensions[_taffyRequest.returnMimeExt]#; charset=utf-8" />
 				<cfif _taffyRequest.resultSerialized neq ('"' & '"')>
-					<cfoutput>#_taffyRequest.resultSerialized#</cfoutput>
+					<cfset local.resultSerialized = _taffyRequest.resultSerialized />
 				</cfif>
 				<!--- debug output --->
 				<cfif structKeyExists(url, application._taffy.settings.debugKey)>
-					<cfoutput><h3>Request Details:</h3><cfdump var="#_taffyRequest#"></cfoutput>
+					<cfset local.debug = true />
 				</cfif>
 
 			<cfelseif _taffyRequest.resultType eq "filename">
@@ -453,6 +525,42 @@
 
 			</cfif>
 		</cfif>
+
+		<cfset local.resultSerialized = "" />
+		<cfif structKeyExists( _taffyRequest, "resultSerialized" )>
+			<cfset local.resultSerialized = _taffyRequest.resultSerialized />
+		</cfif>
+
+		<cfset local.result = StructNew() />
+		<cfif structKeyExists( _taffyRequest, "result" )>
+			<cfset local.result = _taffyRequest.result.getData() />
+		</cfif>
+
+		<!--- ...after the service has finished... --->
+		<cfset m.beforeOnTaffyRequestEnd = getTickCount() />
+		<cfset onTaffyRequestEnd(
+			_taffyRequest.verb
+			,_taffyRequest.matchDetails.beanName
+			,_taffyRequest.requestArguments
+			,_taffyRequest.returnMimeExt
+			,_taffyRequest.headers
+			,_taffyRequest.methodMetadata
+			,local.parsed.matchDetails.srcUri
+			,local.resultSerialized
+			,local.result
+			,_taffyRequest.statusArgs.statusCode
+			) />
+		<cfset m.otreTime = getTickCount() - m.beforeOnTaffyRequestEnd />
+		<cfheader name="X-TIME-IN-ONTAFFYREQUESTEND" value="#m.otreTime#" />
+
+		<cfif len(trim(local.resultSerialized))>
+			<cfoutput>#local.resultSerialized#</cfoutput>
+		</cfif>
+		<!--- debug output --->
+		<cfif local.debug>
+			<cfoutput><h3>Request Details:</h3><cfdump var="#_taffyRequest#"></cfoutput>
+		</cfif>
+
 		<cfreturn true />
 	</cffunction>
 
@@ -466,13 +574,14 @@
 		<cfheader name="X-TAFFY-RELOADED" value="true" />
 		<cfset request.taffyReloaded = true />
 		<cfset local._taffy = structNew() />
-		<cfset local._taffy.version = "3.0.2" />
+		<cfset local._taffy.version = "3.2.0" />
 		<cfset local._taffy.endpoints = structNew() />
 		<!--- default settings --->
 		<cfset local.defaultConfig = structNew() />
 		<cfset local.defaultConfig.docs = structNew() />
 		<cfset local.defaultConfig.docs.APIName = "Your API Name (variables.framework.docs.APIName)" />
 		<cfset local.defaultConfig.docs.APIVersion = "0.0.0 (variables.framework.docs.APIVersion)" />
+		<cfset local.defaultConfig.docsPath = "../dashboard/docs.cfm" />
 		<cfset local.defaultConfig.defaultMime = "" />
 		<cfset local.defaultConfig.debugKey = "debug" />
 		<cfset local.defaultConfig.reloadKey = "reload" />
@@ -488,12 +597,17 @@
 		<cfset local.defaultConfig.unhandledPaths = "/flex2gateway" />
 		<cfset local.defaultConfig.allowCrossDomain = false />
 		<cfset local.defaultConfig.useEtags = false />
+		<cfset local.defaultConfig.exposeHeaders = false />
 		<cfset local.defaultConfig.jsonp = false />
+		<cfset local.defaultConfig.noDataSends204NoContent = false />
 		<cfset local.defaultConfig.globalHeaders = structNew() />
 		<cfset local.defaultConfig.mimeTypes = structNew() />
 		<cfset local.defaultConfig.returnExceptionsAsJson = true />
 		<cfset local.defaultConfig.exceptionLogAdapter = "taffy.bonus.LogToDevNull" />
 		<cfset local.defaultConfig.exceptionLogAdapterConfig = StructNew() />
+		<cfset local.defaultConfig.csrfToken = structNew() />
+		<cfset local.defaultConfig.csrfToken.cookieName = "" />
+		<cfset local.defaultConfig.csrfToken.headerName = "" />
 		<!--- status --->
 		<cfset local._taffy.status = structNew() />
 		<cfset local._taffy.status.internalBeanFactoryUsed = false />
@@ -616,7 +730,7 @@
 
 		<cfset requestObj.body = getRequestBody() />
 		<cfset requestObj.contentType = cgi.content_type />
-		<cfif len(requestObj.body)>
+		<cfif len(requestObj.body) AND requestObj.body neq "null">
 			<cfif findNoCase("multipart/form-data", requestObj.contentType)>
 				<!--- do nothing, to support the way railo handles multipart requests (just avoids the error condition below) --->
 				<cfset requestObj.queryString = cgi.query_string />
@@ -773,7 +887,7 @@
 	<cffunction name="sortURIMatchOrder" access="private" output="false">
 		<cfargument name="endpoints" />
 		<cfset var URIMatchOrder = listToArray( structKeyList(arguments.endpoints, chr(10)), chr(10) ) />
-		<cfset arraySort(URIMatchOrder, "text", "desc") />
+		<cfset arraySort(URIMatchOrder, "textnocase", "desc") />
 		<cfreturn URIMatchOrder />
 	</cffunction>
 
@@ -814,8 +928,9 @@
 		<cfset var ct = listFirst(arguments.contentType,';') />
 		<cfset var fn = application._taffy.contentTypes[ct] />
 		<cfset var args = {} />
+		<cfset var result = {} />
 		<cfset args.body = arguments.body />
-		<cfset result = {} />
+
 		<cfinvoke
 			component="#application._taffy.settings.deserializer#"
 			method="#fn#"
@@ -927,7 +1042,9 @@
 
 	<cffunction name="guessResourcesPath" access="private" output="false" returntype="string" hint="used to try and figure out the absolute path of the /resources folder even though this file may not be in the web root">
 		<!--- if /resources has been explicitly defined in an server/application mapping, it should take precedence --->
-		<cfif directoryExists("/resources")>
+		<cfif directoryExists(expandPath("resources"))>
+			<cfreturn "resources" />
+		<cfelseif directoryExists(expandPath("/resources"))>
 			<cfreturn "/resources" />
 		</cfif>
 
@@ -948,7 +1065,7 @@
 
 	<cffunction name="guessResourcesCFCPath" access="private" output="false" returntype="string">
 		<cfset var path = guessResourcesPath() />
-		<cfset path = right(path, len(path)-1) />
+		<cfif left(path, 1) eq "/"><cfset path = right(path, len(path)-1) /></cfif>
 		<cfreturn reReplace(path, "\/", ".", "all") />
 	</cffunction>
 
@@ -1263,6 +1380,10 @@
 		<cfreturn newRepresentation().noData() />
 	</cffunction>
 
+	<cffunction name="noContent" access="public" output="false">
+		<cfreturn newRepresentation().noContent() />
+	</cffunction>
+
 	<cffunction name="representationOf" access="public" output="false">
 		<cfargument name="data" required="true" />
 		<cfreturn newRepresentation().setData( arguments.data ) />
@@ -1313,7 +1434,7 @@
 		<cfset local.credentials.password = "" />
 		<cftry>
 			<cfset local.encodedCredentials = ListLast( GetPageContext().getRequest().getHeader("Authorization"), " " ) />
-			<cfset local.decodedCredentials = toString( toBinary( local.EncodedCredentials ) ) />
+			<cfset local.decodedCredentials = toString( toBinary( local.EncodedCredentials ), "iso-8859-1" ) />
 			<cfset local.credentials.username = listFirst( local.decodedCredentials, ":" ) />
 			<cfset local.credentials.password = listRest( local.decodedCredentials, ":" ) />
 			<cfcatch></cfcatch>
@@ -1329,6 +1450,9 @@
 		<cfargument name="metadata" type="struct" required="true" />
 		<cfset var result = StructNew() />
 		<cfset var func = '' />
+		<cfset var f = 0 />
+		<cfset var g = 0 />
+		<cfset var foundFunc = false />
 		<cfset result.functions = arrayNew(1) />
 		<!--- don't recurse if we've reached the base component --->
 		<cfif structKeyExists(metadata, "extends") and not metadata.extends.fullname eq "taffy.core.resource">
@@ -1354,7 +1478,18 @@
 			<cfset func = metadata.functions[f] />
 			<!--- ignore hidden methods, if access is not set, assume public --->
 			<cfif not structKeyExists(func, "access") or (func.access neq "private" and func.access neq "package")>
-				<cfset arrayAppend(result.functions, func) />
+				<!--- check to see if this function is already in the list. If so, overwrite, otherwise append --->
+				<cfset foundFunc = False />
+				<cfloop from="1" to="#arrayLen( result.functions )#" index="g">
+					<cfif result.functions[g].NAME EQ func.NAME>
+						<cfset result.functions[g] = func />
+						<cfset foundFunc = True />
+						<cfbreak />
+					</cfif>
+				</cfloop>
+				<cfif NOT foundFunc>
+					<cfset arrayAppend(result.functions, func) />
+				</cfif>
 			</cfif>
 		</cfloop>
 		<cfreturn result />
